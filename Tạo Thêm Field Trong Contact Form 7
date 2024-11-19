@@ -1,0 +1,563 @@
+<?php
+add_filter('wp_check_filetype_and_ext', function ($data, $file, $filename, $mimes) {
+    if (is_admin() && isset($_POST['csv_upload_context']) && $_POST['csv_upload_context'] === 'true') {
+        if (substr($filename, -4) === '.csv') {
+            $data['ext'] = 'csv';
+            $data['type'] = 'text/csv';
+        }
+    }
+
+    return $data;
+}, 10, 4);
+
+
+
+function get_department_data($form_id, $country, $department) {
+    $meta_key = '_countries_departments_data';
+
+    // Retrieve the JSON string from the meta key
+    $departments_data_json = get_post_meta($form_id, $meta_key, true);
+
+    // Decode JSON data into an associative array
+    $departments_data = json_decode($departments_data_json, true);
+
+    // Return null if decoding fails or data is empty
+    if (empty($departments_data)) {
+        return null;
+    }
+
+    // Normalize input country and department for comparison
+    $normalized_country = strtolower(trim($country));
+    $normalized_department = strtolower(trim($department));
+
+    // Iterate through department data to find a match
+    foreach ($departments_data as $data) {
+        $country_name = isset($data['country_name']) ? strtolower(trim($data['country_name'])) : '';
+        $department_name = isset($data['department_name']) ? strtolower(trim($data['department_name'])) : '';
+
+        if ($country_name === $normalized_country && $department_name === $normalized_department) {
+            return [
+                'download_number' => isset($data['download_number']) ? intval($data['download_number']) : 0,
+                'department_email' => $data['department_email'] ?? '',
+            ];
+        }
+    }
+
+    return null;
+}
+
+
+function save_departments_data_to_meta($form_id, $repeater_data) {
+    $meta_key = '_countries_departments_data';
+
+    if ($repeater_data) {
+        $validated_data = validate_repeater_data($repeater_data);
+
+        update_post_meta($form_id, $meta_key, json_encode($validated_data, JSON_UNESCAPED_UNICODE));
+    }
+
+}
+
+
+
+function validate_repeater_data($data) {
+    return array_map(function ($item) {
+        $emails = explode(', ', $item['department_email'] ?? '');
+        $sanitized_emails = array_filter(array_map('sanitize_email', $emails), function($email) {
+            return !empty($email);
+        });
+        $sanitized_email_str = implode(', ', $sanitized_emails);
+
+        return [
+            'country_name' => sanitize_text_field(mb_convert_encoding($item['country_name'] ?? '', 'UTF-8', 'auto')),
+            'department_name' => sanitize_text_field(mb_convert_encoding($item['department_name'] ?? '', 'UTF-8', 'auto')),
+            'download_number' => intval($item['download_number'] ?? 0),
+            'department_email' => $sanitized_email_str,
+        ];
+    }, $data);
+}
+
+
+function import_departments_from_csv($form_id, $file_path) {
+    if (!file_exists($file_path)) {
+        delete_post_meta($form_id, '_countries_departments_data');
+        return;
+    }
+
+    // Read the file content into an array of lines
+    $csv_data = file($file_path);
+
+    // Convert the encoding of each line to UTF-8 if it's not already UTF-8
+    $csv_data = array_map(function ($line) {
+        return iconv('ISO-8859-1', 'UTF-8//TRANSLIT', $line); // Convert to UTF-8 with transliteration
+    }, $csv_data);
+
+    // Remove the header row from the CSV data
+    array_shift($csv_data);
+
+    // Initialize an array to store the processed data
+    $repeater_data = [];
+
+    // Loop through each line of the CSV data
+    foreach ($csv_data as $line) {
+        // Split the CSV line by semicolon delimiter
+        $row = str_getcsv($line, ";");
+
+        // Ensure there are enough columns in the row
+        if (count($row) < 8) {
+            continue;
+        }
+
+        $country_name = isset($row[3]) ? sanitize_text_field(trim($row[3])) : null;
+        $department_name = isset($row[4]) ? sanitize_text_field(trim($row[4])) : null;
+        $download_number = isset($row[5]) ? intval($row[5]) : 0;
+        $department_email_first = isset($row[6]) ? sanitize_email($row[6]) : null;
+        $department_email_last = isset($row[7]) ? sanitize_email($row[7]) : null;
+
+        // Merge department emails if available and valid
+        $department_emails = array_filter([$department_email_first, $department_email_last], function($email) {
+            return filter_var(trim($email), FILTER_VALIDATE_EMAIL); // Validate and trim each email
+        });
+
+
+        // Combine department emails into a single string, separated by a comma and a space
+        $department_email_str = implode(', ', $department_emails);
+
+
+        // Store the processed row into the repeater data array
+        $repeater_data[] = [
+            'country_name' => $country_name,
+            'department_name' => $department_name,
+            'download_number' => $download_number,
+            'department_email' => $department_email_str,
+        ];
+    }
+
+    // Save the processed data into post meta
+    save_departments_data_to_meta($form_id, $repeater_data);
+
+}
+
+
+// Function to check for changes in the CSV field and run the import function
+function check_and_import_acf_csv($post_id) {
+    // Retrieve the CSV file URL or attachment ID
+    $csv_file = get_post_meta($post_id, '_csv_attachment', true);
+
+    // Validate if the file is available
+    if ($csv_file) {
+        // If the file is a URL, resolve the file path
+        $file_path = strpos($csv_file, ABSPATH) === false ? get_attached_file(attachment_url_to_postid($csv_file)) : $csv_file;
+
+        // Check if the resolved file path is valid
+        if ($file_path && file_exists($file_path)) {
+            // Run the import function
+            import_departments_from_csv($post_id, $file_path);
+        }
+    }
+}
+
+
+function get_email_content($content, $tag) {
+    $pattern = sprintf('/\[%s\](.*?)\[\/%s\]/s', preg_quote($tag, '/'), preg_quote($tag, '/'));
+    if (preg_match($pattern, $content, $matches)) {
+        return trim($matches[1]);
+    }
+    return '';
+}
+
+
+add_action('wpcf7_before_send_mail', 'custom_send_mail_data', 10, 1);
+function custom_send_mail_data($contact_form) {
+    // Get the ID of the current form
+    $form_id = $contact_form->id();
+
+    $file_attachment = get_post_meta($form_id, '_media_attachment', true); // Retrieve saved file URL
+
+    // Get status Checkbbox 
+    $status_use_template = get_post_meta($form_id, '_accept_gmail_csv', true);
+
+    // Retrieve Send CC with mail CSV value
+    $send_cc_csv = get_post_meta($form_id, '_send_cc_csv', true);
+
+
+    // Check if the form ID is in the configured list
+
+    $submission = WPCF7_Submission::get_instance();
+
+    // If submission data is available, process it
+    if ($submission && $status_use_template && $file_attachment) {
+        $submission_data = $submission->get_posted_data();
+        $country = isset($submission_data['country']) && is_array($submission_data['country']) && $submission_data['country'][0] ? $submission_data['country'][0] : '';
+        $department = isset($submission_data['department']) && is_array($submission_data['department']) && isset($submission_data['department'][0]) ? $submission_data['department'][0] : '';
+
+        $first_name = isset($submission_data['first-name']) ? $submission_data['first-name'] : '';
+
+        // Retrieve department data based on country and department
+        $department_data = get_department_data($form_id, $country, $department);
+
+        $download_number = 0;
+        $department_email = '';
+        if(isset($submission_data) && is_array($submission_data)) {
+            $download_number = $department_data['download_number'];
+            $department_email = $department_data['department_email'];
+        }
+
+        // Retrieve and modify the mail properties of the contact form
+        $mail = $contact_form->prop('mail'); // Mail 1 (default configuration)
+
+        // Set the recipient list for Mail 1 (admin and department email)
+        $configured_recipients = $mail['recipient'];
+        // Ensure the existing recipient list is not empty
+        $all_recipients_mail = !empty($configured_recipients) ? $configured_recipients : '';
+
+        if (!empty($department_email) && 'yes' == $send_cc_csv) {
+            // Split multiple emails by a comma and a space
+            $emails = array_map('trim', explode(',', $department_email));
+            foreach ($emails as $email) {
+                if (filter_var($email, FILTER_VALIDATE_EMAIL)) {
+                    $all_recipients_mail .= (!empty($all_recipients_mail) ? ',' : '') . $email;
+                }
+            }
+        }
+
+        // Add Content-Type header to enforce HTML rendering
+        $mail['additional_headers'] = "Content-Type: text/html\r\n";
+        $mail['use_html'] = true;
+        if (!empty($all_recipients_mail)) {
+            $additional_headers = isset($mail_2['additional_headers']) ? $mail_2['additional_headers'] : '';
+            $additional_headers .= "CC: $all_recipients_mail\r\n";  // Ensure proper header format
+            $mail['additional_headers'] = $additional_headers;
+        }
+
+        // Update the mail properties for Mail 1
+        $contact_form->set_properties(array('mail' => $mail));
+
+        // Mail 2
+        // Retrieve the second mail properties
+        $mail_2 = $contact_form->prop('mail_2');
+
+        if (isset($mail_2['active']) && $mail_2['active']) {
+
+
+            // Determine the email body based on download number
+            $email_content_no_download = get_email_content($mail_2['body'], 'mail_no_dowload');
+            $email_content_download = get_email_content($mail_2['body'], 'mail_dowload');
+
+            $email_body = ($download_number == 0 ) ? $email_content_no_download : $email_content_download;
+
+            // Replace {First_name} placeholder with the actual first name from the form
+            $email_body = str_replace('{First_name}', $first_name, $email_body);
+
+            // Update the mail body for Mail 1
+            $mail_2['body'] = str_replace('{First_name}', $first_name, $email_body);
+
+            // If download_number is not '0', add the file attachment to Mail 1
+            if ((string)$download_number !== 0 && !empty($file_attachment)) {
+                // Retrieve the physical file path on the server using the file ID
+                $email_body = str_replace('{{ file_attachment }}', $file_attachment, $email_body);
+
+            }
+
+
+            // Set the body of Mail 2 based on the download number
+            $mail_2['body'] = $email_body;
+            // Add Content-Type header to enforce HTML rendering
+            $mail_2['additional_headers'] = "Content-Type: text/html\r\n";
+            $mail_2['use_html'] = true;
+            if (!empty($all_recipients_mail)) {
+                $additional_headers = isset($mail_2['additional_headers']) ? $mail_2['additional_headers'] : '';
+                $additional_headers .= "CC: $all_recipients_mail\r\n";  // Ensure proper header format
+                $mail_2['additional_headers'] = $additional_headers;
+            }
+
+            // Update the mail properties for Mail 2
+            $contact_form->set_properties(array('mail_2' => $mail_2));
+        }
+
+    }
+
+    // Page contact
+    if ($submission && $status_use_template && empty($file_attachment)) {
+        $submission_data = $submission->get_posted_data();
+        $country = isset($submission_data['country']) && is_string($submission_data['country']) ? $submission_data['country'] : '';
+        $department = isset($submission_data['department']) && is_array($submission_data['department']) && isset($submission_data['department'][0]) ? $submission_data['department'][0] : '';
+        $first_name = isset($submission_data['first-name']) ? $submission_data['first-name'] : '';
+
+        // Retrieve department data based on country and department
+        $department_data = get_department_data($form_id, $country, $department);
+
+        $department_email = '';
+        if(isset($department_data) && is_array($department_data)) {
+            $department_email = $department_data['department_email'];
+        }
+
+
+        // Retrieve the mail properties of the contact form
+        $mail = $contact_form->prop('mail'); // Mail 1 (default configuration)
+
+        // Ensure the existing recipient list is not empty
+        $all_cc_mail = '';
+
+        // Add department email if it exists and is valid
+        if (!empty($department_email) && 'yes' === $send_cc_csv) {
+            // Split multiple emails by a comma
+            $emails = array_map('trim', explode(',', $department_email));
+            foreach ($emails as $email) {
+                if (filter_var($email, FILTER_VALIDATE_EMAIL)) {
+                    $all_cc_mail .= (!empty($all_cc_mail) ? ', ' : '') . $email;
+                }
+            }
+        }
+
+        // Add Content-Type header to enforce HTML rendering
+        $mail['additional_headers'] = "Content-Type: text/html\r\n";
+        $mail['use_html'] = true;
+        if (!empty($all_cc_mail)) {
+            $additional_headers = isset($mail['additional_headers']) ? $mail['additional_headers'] : '';
+            $additional_headers .= "CC: $all_cc_mail\r\n";  // Ensure proper header format
+            $mail['additional_headers'] = $additional_headers;
+        }
+
+
+        $contact_form->set_properties(array('mail' => $mail));
+
+    }
+}
+
+
+add_filter('wpcf7_validate_select', 'custom_country_department_validation', 20, 2);
+
+function custom_country_department_validation($result, $tag) {
+    // Retrieve the country value from the submitted form data
+    $country_value = isset($_POST['country']) ? sanitize_text_field($_POST['country']) : '';
+    // Retrieve the department value from the submitted form data
+    $department_value = isset($_POST['department']) ? sanitize_text_field($_POST['department']) : '';
+
+    // Check if the country is 'France' and the department field is empty
+    if ($country_value === 'France' && empty($department_value) && 'department' === $tag->name) {
+        $result->invalidate($tag, __('Please fill out the department field if the country is France.','pcvue'));
+    }
+
+    return $result;
+}
+
+function display_custom_media_selector($post) {
+    $post_id = $post->id();
+
+    // Retrieve Send CC with mail CSV value
+    $send_cc_value = get_post_meta($post_id, '_send_cc_csv', true);
+
+    // Media file
+    $file_url = get_post_meta($post_id, '_media_attachment', true); // Retrieve saved file URL
+    $file_name = $file_url ? basename($file_url) : ''; // Extract file name from the URL
+
+    // CSV file
+    $csv_url = get_post_meta($post_id, '_csv_attachment', true); // Retrieve saved CSV file URL
+    $csv_name = $csv_url ? basename($csv_url) : ''; // Extract file name from the URL
+    ?>
+    <br class="clear">
+    <h2><?php esc_html_e('Mail Advanced', 'contact-form-7'); ?></h2>
+    <fieldset>
+        <table class="form-table">
+            <tbody>
+                <tr>
+                    <th scope="row">
+                        <label for="send_cc_csv">
+                            <?php esc_html_e('To CC With List Email In CSV', 'contact-form-7'); ?>
+                        </label>
+                    </th>
+                    <td>
+                        <select id="send_cc_csv" name="send_cc_csv">
+                            <option value="no" <?php selected($send_cc_value, 'no'); ?>><?php esc_html_e('No', 'contact-form-7'); ?></option>
+                            <option value="yes" <?php selected($send_cc_value, 'yes'); ?>><?php esc_html_e('Yes', 'contact-form-7'); ?></option>
+                        </select>
+                    </td>
+                </tr>
+                <tr>
+                    <th scope="row">
+                        <label for="send_to_gmail">
+                            <?php esc_html_e('Use Template Download', 'contact-form-7'); ?>
+                        </label>
+                    </th>
+                    <td>
+                        <input type="checkbox" id="send_to_gmail" name="send_to_gmail_csv" value="1" <?php checked(get_post_meta($post->id(), '_accept_gmail_csv', true), '1'); ?>>
+                    </td>
+                </tr>
+                <tr>
+                    <th scope="row">
+                        <label for="csv_selector">
+                            <?php esc_html_e('Select CSV File', 'contact-form-7'); ?>
+                        </label>
+                    </th>
+                    <td>
+                        <input type="hidden" id="csv_attachment" name="csv_attachment" value="<?php echo esc_attr($csv_url); ?>">
+                        <button type="button" class="button" id="select-csv">
+                            <?php echo $csv_name ? esc_html__('Change CSV File', 'contact-form-7') : esc_html__('Select CSV File', 'contact-form-7'); ?>
+                        </button>
+                        <button type="button" class="button" id="remove-csv" <?php echo !$csv_url ? 'style="display:none;"' : ''; ?>>
+                            <?php esc_html_e('Remove CSV File', 'contact-form-7'); ?>
+                        </button>
+                        <p id="selected-csv-name">
+                            <?php if ($csv_name): ?>
+                                <?php esc_html_e('Selected CSV File:', 'contact-form-7'); ?> <strong><?php echo esc_html($csv_name); ?></strong>
+                            <?php else: ?>
+                                <?php esc_html_e('No CSV file selected', 'contact-form-7'); ?>
+                            <?php endif; ?>
+                        </p>
+                    </td>
+                </tr>
+                <tr>
+                    <th scope="row">
+                        <label for="media_selector">
+                            <?php esc_html_e('Select A Attachment', 'contact-form-7'); ?>
+                        </label>
+                    </th>
+                    <td>
+                        <input type="hidden" id="media_attachment" name="media_attachment" value="<?php echo esc_attr($file_url); ?>">
+                        <button type="button" class="button" id="select-media">
+                            <?php echo $file_name ? esc_html__('Change File', 'contact-form-7') : esc_html__('Select A Attachment', 'contact-form-7'); ?>
+                        </button>
+                        <button type="button" class="button" id="remove-media" <?php echo !$file_url ? 'style="display:none;"' : ''; ?>>
+                            <?php esc_html_e('Remove File', 'contact-form-7'); ?>
+                        </button>
+                        <p id="selected-file-name">
+                            <?php if ($file_name): ?>
+                                <?php esc_html_e('Selected File:', 'contact-form-7'); ?> <strong><?php echo esc_html($file_name); ?></strong>
+                            <?php else: ?>
+                                <?php esc_html_e('No file selected', 'contact-form-7'); ?>
+                            <?php endif; ?>
+                        </p>
+                    </td>
+                </tr>
+            </tbody>
+        </table>
+    </fieldset>
+    <script>
+        jQuery(document).ready(function ($) {
+            var mediaUploader;
+
+            // Open media library on select/change file button click
+            $('#select-media').on('click', function (e) {
+                e.preventDefault();
+
+                if (mediaUploader) {
+                    mediaUploader.open();
+                    return;
+                }
+
+                mediaUploader = wp.media.frames.file_frame = wp.media({
+                    title: '<?php esc_html_e('Choose File', 'contact-form-7'); ?>',
+                    button: {
+                        text: '<?php esc_html_e('Select File', 'contact-form-7'); ?>'
+                    },
+                    multiple: false
+                });
+
+                mediaUploader.on('select', function () {
+                    var attachment = mediaUploader.state().get('selection').first().toJSON();
+                    $('#media_attachment').val(attachment.url);
+                    $('#selected-file-name').html(`
+                        <?php esc_html_e('Selected File:', 'contact-form-7'); ?> <strong>${attachment.filename}</strong>
+                    `);
+                    $('#select-media').text('<?php esc_html_e('Change File', 'contact-form-7'); ?>');
+                    $('#remove-media').show();
+                });
+
+                mediaUploader.open();
+            });
+
+            // Remove selected file
+            $('#remove-media').on('click', function (e) {
+                e.preventDefault();
+                $('#media_attachment').val('');
+                $('#selected-file-name').html('<?php esc_html_e('No file selected', 'contact-form-7'); ?>');
+                $('#select-media').text('<?php esc_html_e('Select File', 'contact-form-7'); ?>');
+                $(this).hide();
+            });
+
+            // Open media library on select/change CSV button click
+            $('#select-csv').on('click', function (e) {
+                e.preventDefault();
+
+                if (mediaUploader) {
+                    mediaUploader.open();
+                    return;
+                }
+
+                mediaUploader = wp.media.frames.file_frame = wp.media({
+                    title: '<?php esc_html_e('Choose CSV File', 'contact-form-7'); ?>',
+                    button: {
+                        text: '<?php esc_html_e('Select CSV File', 'contact-form-7'); ?>'
+                    },
+                    library: {
+                        type: 'text/csv'
+                    },
+                    multiple: false
+                });
+
+                mediaUploader.on('open', function() {
+                    var wpMediaPostData = wp.media.view.settings.post;
+                    wpMediaPostData.csv_upload_context = true;
+                });
+
+
+                mediaUploader.on('select', function () {
+                    var attachment = mediaUploader.state().get('selection').first().toJSON();
+                    $('#csv_attachment').val(attachment.url);
+                    $('#selected-csv-name').html(`
+                        <?php esc_html_e('Selected CSV File:', 'contact-form-7'); ?> <strong>${attachment.filename}</strong>
+                    `);
+                    $('#select-csv').text('<?php esc_html_e('Change CSV File', 'contact-form-7'); ?>');
+                    $('#remove-csv').show();
+                });
+
+                mediaUploader.open();
+            });
+
+            // Remove selected CSV file
+            $('#remove-csv').on('click', function (e) {
+                e.preventDefault();
+                $('#csv_attachment').val('');
+                $('#selected-csv-name').html('<?php esc_html_e('No CSV file selected', 'contact-form-7'); ?>');
+                $('#select-csv').text('<?php esc_html_e('Select CSV File', 'contact-form-7'); ?>');
+                $(this).hide();
+            });
+        });
+    </script>
+    <?php
+}
+
+add_filter('wpcf7_editor_panels', 'add_checkbox_to_mail_panel');
+function add_checkbox_to_mail_panel($panels) {
+    if (isset($panels['mail-panel'])) {
+        $original_callback = $panels['mail-panel']['callback'];
+        $panels['mail-panel']['callback'] = function($post) use ($original_callback) {
+            call_user_func($original_callback, $post);
+            display_custom_media_selector($post);
+        };
+    }
+    return $panels;
+}
+
+add_action('wpcf7_save_contact_form', 'save_custom_media_attachment');
+function save_custom_media_attachment($contact_form) {
+    $post_id = $contact_form->id();
+
+    $send_cc_csv = isset($_POST['send_cc_csv']) ? sanitize_text_field($_POST['send_cc_csv']) : 'no';
+    update_post_meta($post_id, '_send_cc_csv', $send_cc_csv);
+
+    // Save or remove selected media URL
+    $media_attachment = isset($_POST['media_attachment']) ? sanitize_text_field($_POST['media_attachment']) : '';
+    update_post_meta($post_id, '_media_attachment', $media_attachment);
+
+    // Save or remove selected CSV URL
+    $csv_attachment = isset($_POST['csv_attachment']) ? sanitize_text_field($_POST['csv_attachment']) : '';
+    update_post_meta($post_id, '_csv_attachment', $csv_attachment);
+
+    check_and_import_acf_csv($post_id);
+
+    // Save checkbox value
+    $send_to_gmail = isset($_POST['send_to_gmail_csv']) ? '1' : '0';
+    update_post_meta($post_id, '_accept_gmail_csv', $send_to_gmail);
+}
