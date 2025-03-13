@@ -1,0 +1,188 @@
+<?php
+// Hook vào admin menu để tạo trang quản lý
+add_action('admin_menu', 'cpp_add_admin_menu');
+
+function cpp_add_admin_menu() {
+    add_menu_page(
+        'Clone Posts for Polylang', // Tiêu đề trang
+        'Clone Posts',              // Tiêu đề trong menu
+        'manage_options',           // Quyền truy cập
+        'cpp_clone_posts',          // Slug của trang
+        'cpp_clone_posts_page',     // Callback function để hiển thị trang
+        'dashicons-translation'     // Icon
+    );
+}
+
+// Hàm lấy tất cả các ngôn ngữ
+function get_all_languages_for_select() {
+    global $wpdb;
+
+    // Query để lấy tất cả các ngôn ngữ
+    $query = "
+        SELECT t.* 
+        FROM {$wpdb->terms} t
+        INNER JOIN {$wpdb->term_taxonomy} tt ON t.term_id = tt.term_id
+        WHERE tt.taxonomy = 'language'
+    ";
+
+    $languages = $wpdb->get_results($query);
+
+    if (!empty($languages)) {
+        echo '<select name="language_select" id="language_select" required>';
+        foreach ($languages as $language) {
+            echo '<option value="' . esc_attr($language->slug) . '">' . esc_html($language->name) . '</option>';
+        }
+        echo '</select>';
+    } else {
+        echo 'No languages found.';
+    }
+}
+
+// Hàm hiển thị trang quản lý trong Admin
+function cpp_clone_posts_page() {
+    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        // Kiểm tra nếu form có gửi dữ liệu clone posts
+        if (isset($_POST['clone_posts'])) {
+            // Kiểm tra xem có chọn post_type và language chưa
+            if (isset($_POST['post_type']) && isset($_POST['language_select'])) {
+                cpp_clone_posts($_POST['post_type'], $_POST['language_select']);
+            } else {
+                echo '<div class="error"><p>Please select both Post Type and Language.</p></div>';
+            }
+        }
+        // Kiểm tra nếu form có gửi dữ liệu để xóa bài viết đã clone
+        if (isset($_POST['delete_cloned_posts'])) {
+            cpp_delete_cloned_posts();
+        }
+    }
+
+    ?>
+    <div class="wrap">
+        <h1>Clone Posts for Polylang</h1>
+
+        <form method="post">
+            <h2>Select Post Type</h2>
+            <select name="post_type" required>
+                <?php
+                // Lấy các post type công khai
+                $post_types = get_post_types(array('public' => true), 'objects');
+                foreach ($post_types as $post_type) {
+                    echo '<option value="' . esc_attr($post_type->name) . '">' . esc_html($post_type->labels->singular_name) . '</option>';
+                }
+                ?>
+            </select>
+
+            <h2>Select Language</h2>
+            <?php get_all_languages_for_select(); ?>
+            <p><input type="submit" name="clone_posts" class="button button-primary" value="Clone Posts"></p>
+        </form>
+
+        <!-- Form xóa tất cả bài viết đã clone -->
+        <form method="post">
+            <p><input type="submit" name="delete_cloned_posts" class="button button-secondary" value="Delete All Cloned Posts"></p>
+        </form>
+    </div>
+    <?php
+}
+
+
+// Hàm clone bài viết từ ngôn ngữ 'en' sang ngôn ngữ đã chọn
+function cpp_clone_posts($post_type, $language) {
+    // Lấy tất cả các bài viết trong post_type, ngôn ngữ 'en'
+    $args = array(
+        'post_type' => $post_type,
+        'posts_per_page' => -1,  // Lấy tất cả bài viết
+        'lang' => 'en',          // Chỉ lấy bài viết ngôn ngữ 'en'
+    );
+    $posts = get_posts($args);
+    echo 'Number of posts found: ' . count($posts);
+
+    $log = [];
+
+    foreach ($posts as $post) {
+        // Kiểm tra bài viết đã được tạo ở ngôn ngữ này chưa
+        $existing_translation = pll_get_post($post->ID, $language);
+        if ($existing_translation) {
+            // Nếu bài viết đã tồn tại ở ngôn ngữ này thì bỏ qua (giữ bản dịch cũ)
+            continue;
+        }
+
+        // Clone bài viết
+        $new_post = array(
+            'post_title'   => $post->post_title,
+            'post_content' => $post->post_content,
+            'post_type'    => $post_type,
+            'post_status'  => 'publish',
+            'post_author'  => $post->post_author,
+        );
+
+        // Tạo bài viết mới
+        $new_post_id = wp_insert_post($new_post);
+
+        // Gán ngôn ngữ cho bài viết mới
+        pll_set_post_language($new_post_id, $language);  // Gán ngôn ngữ cho bài viết mới
+
+        // Lấy tất cả các bản dịch của bài viết gốc (bao gồm bản dịch đã có và bản dịch mới)
+        $translations = pll_get_post_translations($post->ID);
+
+        // Thêm bài viết mới vào mối quan hệ dịch hiện có, nếu có
+        $translations[$language] = $new_post_id;
+
+        // Lưu mối quan hệ giữa các bài viết (bài viết gốc và bài viết dịch)
+        pll_save_post_translations($translations);
+
+        // Ghi vào log
+        $log[] = $new_post_id;
+
+        // Sao chép ACF (nếu có)
+        if (function_exists('get_fields')) {
+            $fields = get_fields($post->ID);
+            if ($fields) {
+                foreach ($fields as $key => $value) {
+                    update_field($key, $value, $new_post_id);
+                }
+            }
+        }
+
+        // Sao chép Featured Image (nếu có)
+        if (has_post_thumbnail($post->ID)) {
+            $thumbnail_id = get_post_thumbnail_id($post->ID);
+            set_post_thumbnail($new_post_id, $thumbnail_id);
+        }
+    }
+
+    // Ghi log vào file
+    if ($log) {
+        $log_file = get_template_directory() . '/clone_log.txt'; // Sử dụng get_template_directory() để lấy đường dẫn đúng
+        $log_message = "Cloned posts at " . date('Y-m-d H:i:s') . ":\n";
+        foreach ($log as $post_id) {
+            $log_message .= "Cloned Post ID: $post_id\n";
+        }
+        file_put_contents($log_file, $log_message, FILE_APPEND);
+    }
+
+    echo '<div class="updated"><p>Posts cloned successfully.</p></div>';
+}
+
+// Hàm xóa các bài viết đã clone
+function cpp_delete_cloned_posts() {
+    // Đọc file log để lấy ra ID của các bài viết đã clone
+    $log_file = get_template_directory() . '/clone_log.txt'; // Lấy đường dẫn chính xác cho file log
+    if (file_exists($log_file)) {
+        $log_contents = file_get_contents($log_file);
+        preg_match_all('/Cloned Post ID: (\d+)/', $log_contents, $matches);
+        $post_ids = $matches[1];
+
+        // Xóa các bài viết đã clone
+        foreach ($post_ids as $post_id) {
+            wp_delete_post($post_id, true); // Xóa bài viết vĩnh viễn
+        }
+
+        // Xóa log sau khi xóa bài viết
+        file_put_contents($log_file, '');
+
+        echo '<div class="updated"><p>Cloned posts deleted successfully.</p></div>';
+    } else {
+        echo '<div class="error"><p>No cloned posts found in the log.</p></div>';
+    }
+}
