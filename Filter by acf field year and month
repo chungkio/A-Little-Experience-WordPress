@@ -1,0 +1,336 @@
+<?php
+function enqueue_ajax_script() {
+    // Enqueue your custom JavaScript file
+    wp_enqueue_script('event-filter-ajax', get_template_directory_uri() . '/assets/js/ajax-filter.js', array('jquery'), null, true);
+
+    // Localize the script with AJAX URL
+    wp_localize_script('event-filter-ajax', 'ajax_params', array(
+        'ajax_url' => admin_url('admin-ajax.php')
+    ));
+
+     // add CSS
+     if (is_page_template('templates/events.php')) {
+        wp_enqueue_style('events-style', get_template_directory_uri() . '/assets/css/events-style.css', null, wp_get_theme()->get('Version'), 'all');
+    }
+
+    if (is_singular('events') || is_post_type_archive('events')) {
+        // Enqueue the CSS file
+        wp_enqueue_style('events-css', get_template_directory_uri() . '/assets/css/events-single.css', array(), wp_get_theme()->get('Version'));
+    }
+}
+add_action('wp_enqueue_scripts', 'enqueue_ajax_script');
+
+function eventFormatDate($date_str) {
+    // Convert the string to a DateTime object
+    $date_obj = DateTime::createFromFormat('d/m/Y', $date_str);
+
+    // Format the DateTime object to the desired format
+    $formatted_date = $date_obj->format('d M Y');
+    return $formatted_date;
+}
+
+function filter_events_by_empty() {
+    // Initialize an empty array for filtered posts
+    $filtered_posts = [];
+
+    // Set up the WP_Query args
+    $args = array(
+        'post_type' => 'events',
+        'post_status' => 'publish',
+        'posts_per_page' => -1,  // Retrieve all posts (will handle pagination later)
+        'lang' => pll_current_language()
+    );
+    // Query the events
+    $query = new WP_Query($args);
+
+    if ($query->have_posts()) {
+        while ($query->have_posts()) {
+            $query->the_post();
+
+            // Get the 'event__date' field (assuming it's in DD/MM/YYYY format)
+            $event_date = get_field('event__date');
+            $date_from = isset($event_date['form']) ? $event_date['form'] : '';
+            $date_to = isset($event_date['to']) ? $event_date['to'] : '';
+
+            // Convert date strings to DateTime objects for comparison
+            $date_from_parts = $date_from ? explode('/', $date_from) : [];
+            $date_to_parts = $date_to ? explode('/', $date_to) : [];
+
+            // Check if at least one date is provided
+            if ((count($date_from_parts) == 3) || (count($date_to_parts) == 3)) {
+                // Convert to DateTime objects if valid
+                $date_from_obj = $date_from ? DateTime::createFromFormat('d/m/Y', $date_from) : null;
+                $date_to_obj = $date_to ? DateTime::createFromFormat('d/m/Y', $date_to) : null;
+
+                // If only $date_from is provided, set $date_to to the same value
+                if ($date_from_obj && !$date_to_obj) {
+                    $date_to_obj = $date_from_obj;  // Assume it ends on the same date
+                }
+
+                // If only $date_to is provided, set $date_from to the same value
+                if (!$date_from_obj && $date_to_obj) {
+                    $date_from_obj = $date_to_obj;  // Assume it starts on the same date
+                }
+
+                // Store post ID along with its dates for sorting later
+                $filtered_posts[] = array(
+                    'post_id' => get_the_ID(),
+                    'date_from' => $date_from_obj,
+                    'date_to' => $date_to_obj,
+                );
+            }
+
+        }
+        wp_reset_postdata();  // Reset the query
+    }
+    usort($filtered_posts, function ($a, $b) {
+        // Compare by date_from first, then date_to
+        if ($a['date_from'] == $b['date_from']) {
+            return $b['date_to'] <=> $a['date_to'];  // Sort by date_to if date_from is the same
+        }
+        return $b['date_from'] <=> $a['date_from'];  // Sort by date_from descending
+    });
+
+    $event_ids = [];
+    // Loop through the events and get the post IDs
+    foreach ($filtered_posts as $event) {
+        $event_ids[] = $event['post_id'];
+    }
+
+    return array_unique($event_ids);
+}
+
+function filter_events_by_year_and_month($selected_year, $selected_month) {
+    $filtered_posts = [];
+    $args = array(
+        'post_type' => 'events',
+        'post_status' => 'publish',
+        'posts_per_page' => -1, // Get all posts
+        'lang' => pll_current_language(),
+    );
+
+    $query = new WP_Query($args);
+
+    if ($query->have_posts()) {
+        while ($query->have_posts()) {
+            $query->the_post();
+
+            // Get the 'event__date' field (assuming it's in DD/MM/YYYY format)
+            $event_date = get_field('event__date');
+            $date_from = isset($event_date['form']) ? $event_date['form'] : '';
+            $date_to = isset($event_date['to']) ? $event_date['to'] : '';
+
+            // Convert date strings to DateTime objects for comparison
+            $date_from_parts = $date_from ? explode('/', $date_from) : [];
+            $date_to_parts = $date_to ? explode('/', $date_to) : [];
+
+            // Check if at least one date is provided
+            if ((count($date_from_parts) == 3) || (count($date_to_parts) == 3)) {
+                // Convert to DateTime objects if valid
+                $date_from_obj = $date_from ? DateTime::createFromFormat('d/m/Y', $date_from) : null;
+                $date_to_obj = $date_to ? DateTime::createFromFormat('d/m/Y', $date_to) : null;
+
+                // If only $date_from is provided, set $date_to to the same value
+                if ($date_from_obj && !$date_to_obj) {
+                    $date_to_obj = $date_from_obj;  // Assume it ends on the same date
+                }
+
+                // If only $date_to is provided, set $date_from to the same value
+                if (!$date_from_obj && $date_to_obj) {
+                    $date_from_obj = $date_to_obj;  // Assume it starts on the same date
+                }
+
+                // Filter events by year and month
+                $event_year = $date_from_obj ? $date_from_obj->format('Y') : '';
+                $event_month = $date_from_obj ? $date_from_obj->format('m') : '';
+
+                // Case 1: If both year and month are selected
+                if ($selected_year && $selected_month) {
+                    if ($event_year == $selected_year && $event_month <= $selected_month) {
+                        // Store post ID along with its dates for sorting later
+                        $filtered_posts[] = array(
+                            'post_id' => get_the_ID(),
+                            'date_from' => $date_from_obj,
+                            'date_to' => $date_to_obj,
+                        );
+                    }
+                }
+
+                // Case 2: If only the year is selected, include all months of that year
+                if ($selected_year && !$selected_month) {
+                    if ($event_year == $selected_year) {
+                        $filtered_posts[] = array(
+                            'post_id' => get_the_ID(),
+                            'date_from' => $date_from_obj,
+                            'date_to' => $date_to_obj,
+                        );
+                    }
+                }
+
+                // Case 3: If only the month is selected (without year), include all years but for the selected month
+                if (!$selected_year && $selected_month) {
+                    if ($event_month <= $selected_month) {
+                        $filtered_posts[] = array(
+                            'post_id' => get_the_ID(),
+                            'date_from' => $date_from_obj,
+                            'date_to' => $date_to_obj,
+                        );
+                    }
+                }
+            }
+        }
+        wp_reset_postdata(); // Reset the query
+    }
+
+    // Sort the filtered posts by date_from (descending)
+    usort($filtered_posts, function ($a, $b) {
+        if ($a['date_from'] == $b['date_from']) {
+            return $b['date_to'] <=> $a['date_to']; // Sort by date_to descending if date_from is the same
+        }
+        return $b['date_from'] <=> $a['date_from']; // Sort by date_from descending
+    });
+
+    $event_ids = [];
+    foreach ($filtered_posts as $event) {
+        $event_ids[] = $event['post_id'];
+    }
+
+    return array_unique($event_ids); // Return unique post IDs
+}
+
+function get_filtered_posts_with_pagination($filtered_posts, $paged) {
+    $posts_per_page = 9;
+
+    $filtered_posts_query = new WP_Query(array(
+        'post_type' => 'events',
+        'posts_per_page' => $posts_per_page,
+        'paged' => $paged,
+        'post__in' => $filtered_posts,
+        'orderby' => 'post__in',
+    ));
+
+    return $filtered_posts_query;
+}
+
+function display_filtered_events($filtered_posts_query) {
+    if ($filtered_posts_query->have_posts()) {
+        echo '<div class="events-list">';
+        while ($filtered_posts_query->have_posts()) {
+            $filtered_posts_query->the_post();
+            get_template_part('template-parts/events/items', null, array(
+                'ids' => get_the_ID()
+            ));
+        }
+        echo '</div>';
+    } else {
+        echo '<p>No events found.</p>';
+    }
+}
+
+
+function display_pagination($filtered_posts_query, $paged) {
+    $total_pages = $filtered_posts_query->max_num_pages;
+
+    if ($total_pages > 1) {
+        echo '<div class="event__pagination" data-aos="fade-up">';
+
+        // Generate pagination links
+        $pagination_links = paginate_links(array(
+            'total' => $total_pages,
+            'current' => $paged,
+            'prev_text' => '<svg width="14" height="12" viewBox="0 0 14 12" fill="none" xmlns="http://www.w3.org/2000/svg">
+                            <path d="M6.17703 10.75L1.30029 6L6.17703 1.25" stroke="#2957A4" stroke-width="1.4" stroke-linejoin="round"/>
+                            <path d="M1.84277 6.09667L12.7005 6.09667" stroke="#2957A4" stroke-width="1.4" stroke-linecap="square"/>
+                            </svg>',
+            'next_text' => '<svg width="14" height="12" viewBox="0 0 14 12" fill="none" xmlns="http://www.w3.org/2000/svg">
+                            <path d="M7.82346 1.25L12.7002 6L7.82346 10.75" stroke="#2957A4" stroke-width="1.4" stroke-linejoin="round"/>
+                            <path d="M12.1577 5.90333H1.29999" stroke="#2957A4" stroke-width="1.4" stroke-linecap="square"/>
+                            </svg>
+                            ',
+            'type' => 'array',  // Return the pagination links as an array
+        ));
+
+        if ($pagination_links) {
+            foreach ($pagination_links as $link) {
+                // Add data-page attribute to each pagination link for AJAX handling
+                // Ensure that only the page number is added to the data-page attribute
+                // Get the page number from the URL by using a regular expression
+                preg_match('/page\/(\d+)\//', $link, $matches); 
+                $page_number = isset($matches[1]) ? $matches[1] : '';
+
+                if ($page_number) {
+                    $link_with_data_page = preg_replace('/href=["\']([^"\']+)["\']/', 'href="$1" data-page="' . $page_number . '"', $link);
+                } else {
+                    $link_with_data_page = $link; // Just in case there's an error in getting the page number
+                }
+
+                // Output the updated link
+                echo '<span class="pagination-link">' . $link_with_data_page . '</span>';
+            }
+        }
+
+        echo '</div>';
+    }
+}
+
+add_action('wp_ajax_filter_events', 'filter_events_ajax');  // For logged-in users
+add_action('wp_ajax_nopriv_filter_events', 'filter_events_ajax');  // For non-logged-in users
+
+function filter_events_ajax() {
+    // Sanitize and retrieve data from $_GET
+    $selected_year = isset($_GET['year']) ? sanitize_text_field($_GET['year']) : '';
+    $selected_month = isset($_GET['month']) ? sanitize_text_field($_GET['month']) : '';
+    $paged = isset($_GET['paged']) ? intval($_GET['paged']) : 1;  // Default to page 1 if not set
+
+    $filtered_posts_query = null;
+
+    // Filter posts based on year and month
+    if(empty($selected_year) && empty($selected_month)) {
+        $filtered_posts = filter_events_by_empty();
+    } else {
+        $filtered_posts = filter_events_by_year_and_month($selected_year, $selected_month);
+        // Query the filtered posts with pagination
+    }
+
+    $filtered_posts_query = get_filtered_posts_with_pagination($filtered_posts, $paged);
+
+
+
+    // Start output buffering to capture the HTML content
+    ob_start();
+
+    // Display filtered events
+    if(!empty($filtered_posts)) {
+        display_filtered_events($filtered_posts_query);
+    }
+
+    // Capture the content of filtered events
+    $events_content = ob_get_clean();
+
+    // Start output buffering again for pagination
+    ob_start();
+
+    // Display pagination
+    if(!empty($filtered_posts)) {
+        display_pagination($filtered_posts_query, $paged);
+    }
+
+    // Capture the pagination content
+    $pagination_content = ob_get_clean();
+
+    $total = count($filtered_posts);
+    $message = sprintf(
+        pll__( 'Showing %d result' ),
+        $total
+    );
+
+    // Return the filtered events and pagination content as a JSON response
+    wp_send_json_success(array(
+        'total' => $message,
+        'events_content' => !empty($events_content) ? $events_content : '<p>No events found.</p>',
+        'pagination_content' => !empty($pagination_content) ? $pagination_content : false,
+    ));
+
+    wp_reset_postdata();  // Reset the query
+    die();  // End the request
+}
