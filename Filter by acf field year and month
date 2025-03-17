@@ -115,87 +115,115 @@ function filter_events_by_year_and_month($selected_year, $selected_month) {
         while ($query->have_posts()) {
             $query->the_post();
 
-            // Get the 'event__date' field (assuming it's in DD/MM/YYYY format)
+            // Get event date fields (expected format: DD/MM/YYYY)
             $event_date = get_field('event__date');
             $date_from = isset($event_date['form']) ? $event_date['form'] : '';
             $date_to = isset($event_date['to']) ? $event_date['to'] : '';
 
-            // Convert date strings to DateTime objects for comparison
-            $date_from_parts = $date_from ? explode('/', $date_from) : [];
-            $date_to_parts = $date_to ? explode('/', $date_to) : [];
+            // Convert to DateTime objects
+            $date_from_obj = $date_from ? DateTime::createFromFormat('d/m/Y', $date_from) : null;
+            $date_to_obj = $date_to ? DateTime::createFromFormat('d/m/Y', $date_to) : null;
 
-            // Check if at least one date is provided
-            if ((count($date_from_parts) == 3) || (count($date_to_parts) == 3)) {
-                // Convert to DateTime objects if valid
-                $date_from_obj = $date_from ? DateTime::createFromFormat('d/m/Y', $date_from) : null;
-                $date_to_obj = $date_to ? DateTime::createFromFormat('d/m/Y', $date_to) : null;
+            // 🟢 Handle missing start or end date (assume single-day event)
+            if ($date_from_obj && !$date_to_obj) {
+                $date_to_obj = clone $date_from_obj;
+            }
+            if (!$date_from_obj && $date_to_obj) {
+                $date_from_obj = clone $date_to_obj;
+            }
 
-                // If only $date_from is provided, set $date_to to the same value
-                if ($date_from_obj && !$date_to_obj) {
-                    $date_to_obj = $date_from_obj;  // Assume it ends on the same date
+            // 🔴 Ignore events that have no valid date
+            if (!$date_from_obj || !$date_to_obj) {
+                continue;
+            }
+
+            // Extract year and month for filtering
+            $event_year_from = $date_from_obj->format('Y');
+            $event_month_from = $date_from_obj->format('m');
+            $event_year_to = $date_to_obj->format('Y');
+            $event_month_to = $date_to_obj->format('m');
+
+            // 🟢 Filtering by selected year and month
+            if ($selected_year && $selected_month) {
+                if (
+                    // Case 1: Event starts in the selected month & year
+                    ($event_year_from == $selected_year && $event_month_from == $selected_month) ||
+
+                    // Case 2: Event ends in the selected month & year
+                    ($event_year_to == $selected_year && $event_month_to == $selected_month) ||
+
+                    // Case 3: Event spans across the selected month (starts before, ends after)
+                    ($event_year_from < $selected_year && $event_year_to > $selected_year) ||
+
+                    // Case 4: Event starts and ends within the same year but spans the selected month
+                    ($event_year_from == $selected_year && $event_year_to == $selected_year &&
+                        $event_month_from <= $selected_month && $event_month_to >= $selected_month) ||
+
+                    // Case 5: Event starts in a previous year but ends in the selected month & year
+                    ($event_year_from < $selected_year && $event_year_to == $selected_year && $event_month_to >= $selected_month) ||
+
+                    // Case 6: Event starts in the selected month & year but ends in the next year
+                    ($event_year_from == $selected_year && $event_month_from <= $selected_month && $event_year_to > $selected_year) ||
+
+                    // 🟢 Case 7: Special handling for December & January (cross-year events)
+                    ($selected_month == 1 && $event_year_to == $selected_year && $event_month_to == 1 && $event_year_from == ($selected_year - 1) && $event_month_from == 12) ||
+                    ($selected_month == 12 && $event_year_from == $selected_year && $event_month_from == 12 && $event_year_to == ($selected_year + 1) && $event_month_to == 1)
+                ) {
+                    $filtered_posts[] = array(
+                        'post_id' => get_the_ID(),
+                        'date_from' => $date_from_obj,
+                        'date_to' => $date_to_obj,
+                    );
                 }
-
-                // If only $date_to is provided, set $date_from to the same value
-                if (!$date_from_obj && $date_to_obj) {
-                    $date_from_obj = $date_to_obj;  // Assume it starts on the same date
+            } elseif ($selected_year && !$selected_month) {
+                // 🟢 If only the year is selected, include all events within that year
+                if ($event_year_from == $selected_year || $event_year_to == $selected_year) {
+                    $filtered_posts[] = array(
+                        'post_id' => get_the_ID(),
+                        'date_from' => $date_from_obj,
+                        'date_to' => $date_to_obj,
+                    );
                 }
+            } elseif (!$selected_year && $selected_month) {
+                // 🟢 If only the month is selected (without a specific year), include events in that month regardless of the year
+                if (
+                    // ✅ Case 1: Event starts in the selected month (any year)
+                    ($event_month_from == $selected_month) ||
 
-                // Filter events by year and month
-                $event_year = $date_from_obj ? $date_from_obj->format('Y') : '';
-                $event_month = $date_from_obj ? $date_from_obj->format('m') : '';
+                    // ✅ Case 2: Event ends in the selected month (any year)
+                    ($event_month_to == $selected_month) ||
 
-                // Case 1: If both year and month are selected
-                if ($selected_year && $selected_month) {
-                    if ($event_year == $selected_year && $event_month <= $selected_month) {
-                        // Store post ID along with its dates for sorting later
-                        $filtered_posts[] = array(
-                            'post_id' => get_the_ID(),
-                            'date_from' => $date_from_obj,
-                            'date_to' => $date_to_obj,
-                        );
-                    }
-                }
+                    // ✅ Case 3: Event spans across the selected month (starts before, ends after)
+                    ($event_month_from < $selected_month && $event_month_to > $selected_month) ||
 
-                // Case 2: If only the year is selected, include all months of that year
-                if ($selected_year && !$selected_month) {
-                    if ($event_year == $selected_year) {
-                        $filtered_posts[] = array(
-                            'post_id' => get_the_ID(),
-                            'date_from' => $date_from_obj,
-                            'date_to' => $date_to_obj,
-                        );
-                    }
-                }
+                    // ✅ Case 4: Event starts before and ends in the selected month
+                    ($event_month_from < $selected_month && $event_month_to >= $selected_month) ||
 
-                // Case 3: If only the month is selected (without year), include all years but for the selected month
-                if (!$selected_year && $selected_month) {
-                    if ($event_month <= $selected_month) {
-                        $filtered_posts[] = array(
-                            'post_id' => get_the_ID(),
-                            'date_from' => $date_from_obj,
-                            'date_to' => $date_to_obj,
-                        );
-                    }
+                    // ✅ Case 5: Event starts in the selected month and ends after it
+                    ($event_month_from <= $selected_month && $event_month_to > $selected_month) ||
+
+                    // ✅ Case 6: Handle events spanning across different years
+                    // This checks if an event starts in one year and ends in another
+                    (($event_month_from > $event_month_to) && ($selected_month >= $event_month_from || $selected_month <= $event_month_to))
+                ) {
+                    $filtered_posts[] = array(
+                        'post_id' => get_the_ID(),
+                        'date_from' => $date_from_obj,
+                        'date_to' => $date_to_obj,
+                    );
                 }
             }
         }
-        wp_reset_postdata(); // Reset the query
+        wp_reset_postdata();
     }
 
-    // Sort the filtered posts by date_from (descending)
+    // 🟢 Sort events by start date (newest first)
     usort($filtered_posts, function ($a, $b) {
-        if ($a['date_from'] == $b['date_from']) {
-            return $b['date_to'] <=> $a['date_to']; // Sort by date_to descending if date_from is the same
-        }
-        return $b['date_from'] <=> $a['date_from']; // Sort by date_from descending
+        return $b['date_from'] <=> $a['date_from'];
     });
 
-    $event_ids = [];
-    foreach ($filtered_posts as $event) {
-        $event_ids[] = $event['post_id'];
-    }
-
-    return array_unique($event_ids); // Return unique post IDs
+    // 🟢 Return unique post IDs
+    return array_unique(array_column($filtered_posts, 'post_id'));
 }
 
 function get_filtered_posts_with_pagination($filtered_posts, $paged) {
@@ -223,7 +251,7 @@ function display_filtered_events($filtered_posts_query) {
         }
         echo '</div>';
     } else {
-        echo '<p>No events found.</p>';
+        echo '<p>'.pll__('No events found.').'</p>';
     }
 }
 
@@ -245,23 +273,21 @@ function display_pagination($filtered_posts_query, $paged) {
             'next_text' => '<svg width="14" height="12" viewBox="0 0 14 12" fill="none" xmlns="http://www.w3.org/2000/svg">
                             <path d="M7.82346 1.25L12.7002 6L7.82346 10.75" stroke="#2957A4" stroke-width="1.4" stroke-linejoin="round"/>
                             <path d="M12.1577 5.90333H1.29999" stroke="#2957A4" stroke-width="1.4" stroke-linecap="square"/>
-                            </svg>
-                            ',
+                            </svg>',
             'type' => 'array',  // Return the pagination links as an array
         ));
 
         if ($pagination_links) {
             foreach ($pagination_links as $link) {
-                // Add data-page attribute to each pagination link for AJAX handling
-                // Ensure that only the page number is added to the data-page attribute
-                // Get the page number from the URL by using a regular expression
-                preg_match('/page\/(\d+)\//', $link, $matches); 
+                // Extract the page number
+                preg_match('/page\/(\d+)\//', $link, $matches);
                 $page_number = isset($matches[1]) ? $matches[1] : '';
 
+                // Add data-page attribute to each pagination link
                 if ($page_number) {
                     $link_with_data_page = preg_replace('/href=["\']([^"\']+)["\']/', 'href="$1" data-page="' . $page_number . '"', $link);
                 } else {
-                    $link_with_data_page = $link; // Just in case there's an error in getting the page number
+                    $link_with_data_page = $link; // Handle the case where the page number is not found
                 }
 
                 // Output the updated link
@@ -272,6 +298,7 @@ function display_pagination($filtered_posts_query, $paged) {
         echo '</div>';
     }
 }
+
 
 add_action('wp_ajax_filter_events', 'filter_events_ajax');  // For logged-in users
 add_action('wp_ajax_nopriv_filter_events', 'filter_events_ajax');  // For non-logged-in users
@@ -327,7 +354,7 @@ function filter_events_ajax() {
     // Return the filtered events and pagination content as a JSON response
     wp_send_json_success(array(
         'total' => $message,
-        'events_content' => !empty($events_content) ? $events_content : '<p>No events found.</p>',
+        'events_content' => !empty($events_content) ? $events_content : '<p>'.pll__('No events found.').'</p>',
         'pagination_content' => !empty($pagination_content) ? $pagination_content : false,
     ));
 
