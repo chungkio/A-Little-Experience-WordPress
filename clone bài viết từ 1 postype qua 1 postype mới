@@ -1,0 +1,478 @@
+<?php
+
+function get_all_languages_for_select() {
+    global $wpdb;
+
+    $query = "
+        SELECT t.* 
+        FROM {$wpdb->terms} t
+        INNER JOIN {$wpdb->term_taxonomy} tt ON t.term_id = tt.term_id
+        WHERE tt.taxonomy = 'language'
+    ";
+
+    $languages = $wpdb->get_results($query);
+
+    $language_slugs = array();
+
+    foreach ($languages as $language) {
+        $language_slugs[] = $language->slug;
+    }
+
+    return $language_slugs;
+}
+
+
+function extract_and_remove_video_url($post_content) {
+    $video_urls = array(
+        '/https?:\/\/(www\.)?(youtube\.com|youtu\.be)\/[^\s]+/', // YouTube
+        '/https?:\/\/(www\.)?vimeo\.com\/[^\s]+/', // Vimeo
+        '/https?:\/\/[^\s]+\.mp4/',
+    );
+
+    foreach ($video_urls as $pattern) {
+        if (preg_match($pattern, $post_content, $matches)) {
+            $video_url = $matches[0];
+            $post_content = str_replace($video_url, '', $post_content);
+            return array('post_content' => $post_content, 'video_url' => $video_url);
+        }
+    }
+
+    return array('post_content' => $post_content, 'video_url' => '');
+}
+
+
+function update_video_acf_field($new_post_id, $video_url) {
+    if (strpos($video_url, 'youtube.com') !== false || strpos($video_url, 'youtu.be') !== false) {
+        update_field('youtube_link', $video_url, $new_post_id);
+    } elseif (strpos($video_url, 'vimeo.com') !== false) {
+        update_field('vimeo_link', $video_url, $new_post_id);
+    } elseif ($video_url != '') {
+        update_field('video_mp4_upload', $video_url, $new_post_id);
+    }
+}
+
+
+function update_banner_type_acf_field($new_post_id, $video_url) {
+    if (strpos($video_url, 'youtube.com') !== false || strpos($video_url, 'youtu.be') !== false) {
+        update_field('choose_the_type_of_banner', 'Youtube Link', $new_post_id);
+    } elseif (strpos($video_url, 'vimeo.com') !== false) {
+        update_field('choose_the_type_of_banner', 'Vimeo Link', $new_post_id);
+    } elseif ($video_url != '') {
+        update_field('choose_the_type_of_banner', 'Video Upload', $new_post_id);
+    }
+}
+
+
+function update_event_date_acf_field($new_post_id, $post_id) {
+    // Get the raw post date instead of formatted date
+    $post_date = get_post_field('post_date', $post_id);
+    $formatted_date = date('Y-m-d', strtotime($post_date)); // Convert to ACF format
+
+    // Define group field and subfield
+    $parent_field = 'event__date'; // Group field key
+    $child_field = 'form'; // Date Picker field inside the group
+
+    // Prepare data structure
+    $date_data = array(
+        $child_field => $formatted_date
+    );
+
+    // Update ACF field on the NEW POST ID
+    update_field($parent_field, $date_data, $new_post_id);
+
+}
+
+
+
+
+function create_event_post($post_title, $lang = 'en', $original_post_id = 0) {
+    $original_post = get_post($original_post_id);
+    $post_content = isset($original_post->post_content) ? $original_post->post_content : ''; // Copy content
+    $post_date = isset($original_post->post_date) ? $original_post->post_date : current_time('mysql'); // Get post date
+
+    // Remove video URL
+    $result = extract_and_remove_video_url($post_content);
+    $post_content = $result['post_content'];
+    $video_url = $result['video_url'];
+
+    // Create new post
+    $new_post = array(
+        'post_title'   => $post_title,
+        'post_content' => $post_content,
+        'post_status'  => 'publish', // Ensure post is published
+        'post_type'    => 'events',
+        'post_author'  => get_current_user_id(), // The current logged-in user
+        'post_date'    => $post_date, // Ensure correct post date
+    );
+
+    // Insert new post
+    $new_post_id = wp_insert_post($new_post);
+    if (is_wp_error($new_post_id)) {
+        return 0;
+    }
+
+    // Update ACF fields
+    update_video_acf_field($new_post_id, $video_url);
+    update_banner_type_acf_field($new_post_id, $video_url);
+    update_event_date_acf_field($new_post_id, $original_post_id);
+    update_event_featured_image($new_post_id, $original_post_id);
+
+    pll_set_post_language($new_post_id, $lang);
+
+    // Log the cloned post ID
+    log_cloned_post_id($new_post_id, $post_title, $original_post_id, $lang);
+
+    return $new_post_id;
+}
+
+function update_event_featured_image ( $new_post_id, $original_post_id) {
+    $featured_image_id = get_post_meta($original_post_id, '_thumbnail_id', true);
+
+    if ($featured_image_id && get_post($featured_image_id)) {
+        $new_post_thumbnail = get_post_meta($new_post_id, '_thumbnail_id', true);
+        if (!$new_post_thumbnail) {
+            set_post_thumbnail($new_post_id, $featured_image_id);
+        }
+    }
+}
+
+
+
+function clone_posts_from_json() {
+    $json_file = WP_CONTENT_DIR . '/media_posts.json'; 
+
+    if (file_exists($json_file)) {
+        $json_data = file_get_contents($json_file);
+        $media_posts_data = json_decode($json_data, true);
+
+        if ($media_posts_data) {
+            foreach ($media_posts_data as $post_data) {
+                $new_post_id = create_event_post($post_data['post_title'], 'en', $post_data['post_id']);
+
+                if ($new_post_id) {
+                    log_event("Created new event post for original post ID: {$new_post_id}");
+
+                    $translations = array();
+
+                    foreach ($post_data['list_translate'] as $translation) {
+                        $translated_post_id = $translation['translation']['translated_post_id'];
+
+                        $translated_post = get_post($translated_post_id);
+
+                        if ($translated_post) {
+                            $new_translation_post_id = create_event_post($translated_post->post_title, $translation['translation']['language'], $translated_post_id);
+
+                            if ($new_translation_post_id) {
+                                copy_acf_and_thumbnail($translated_post_id, $new_translation_post_id);
+
+                                $translations[$translation['translation']['language']] = $new_translation_post_id;
+
+                                log_event("Created and linked translation post ID: {$new_translation_post_id} for language {$translation['translation']['language']}");
+                            } else {
+                                log_event("Failed to create translation post for post ID: {$translated_post_id} in language {$translation['translation']['language']}");
+                            }
+                        } else {
+                            log_event("Failed to retrieve translated post with ID: {$translated_post_id}");
+                        }
+                    }
+
+                    if (!empty($translations)) {
+                        $translations['en'] = $new_post_id;
+                        pll_save_post_translations($translations);
+
+                        log_event("Linked translations to original post ID: {$new_post_id}");
+                    }
+                } else {
+                    log_event("Failed to create event post for original post title: {$post_data['post_title']}");
+                }
+            }
+
+            echo '<div class="updated"><p>All posts have been processed and created.</p></div>';
+        } else {
+            log_event("Failed to decode JSON data.");
+            echo '<div class="error"><p>Failed to decode JSON data.</p></div>';
+        }
+    } else {
+        log_event("File media_posts.json not found.");
+        echo '<div class="error"><p>File media_posts.json not found.</p></div>';
+    }
+}
+
+
+
+function copy_acf_and_thumbnail($old_post_id, $new_post_id) {
+    $acf_fields = get_fields($old_post_id);
+
+    if ($acf_fields) {
+        foreach ($acf_fields as $field_name => $field_value) {
+            if ($field_name === 'event__date_form') {
+                continue;
+            }
+
+            update_field($field_name, $field_value, $new_post_id);
+            log_event("Copied ACF field: {$field_name} for post ID: {$new_post_id}");
+        }
+    } else {
+        log_event("No ACF fields found for post ID: {$old_post_id}");
+    }
+
+    update_event_featured_image($old_post_id, $new_post_id);
+}
+
+
+function clone_media_posts_to_events() {
+    if (!current_user_can('edit_posts')) {
+        log_event("User does not have permission to edit posts.");
+        return;
+    }
+
+    echo '<div class="wrap">';
+        echo '<div class="event__wrap--heading">';
+            echo '<h2>Clone Media Posts Event Step</h2>';
+        echo '</div>';
+        echo '<div class="event__wrap--log">';
+            echo '<h3>Step 1: Log Media Posts</h3>';
+            echo '<form method="post" action="">';
+            echo '<input type="submit" name="log_post" value="Log Posts" class="button button-danger">';
+            echo '</form>';
+
+            if (isset($_POST['log_post'])) {
+                log_media_posts_and_translations();
+            }
+
+        echo '</div>';
+
+        echo '<div class="event__wrap--clone">';
+            echo '<h3>Step 2: Clone Media Posts to Events</h3>';
+            echo '<form method="post" action="">';
+            echo '<input type="submit" name="clone_post" value="Clone Posts" class="button button-danger">';
+            echo '</form>';
+            if (isset($_POST['clone_post'])) {
+                clone_posts_from_json();
+            }
+        echo '</div>';
+
+        echo '<div class="event__wrap--remove">';
+            echo '<h3>Delete All Events</h3>';
+            echo '<form method="post" action="">';
+            echo '<p>Are you sure you want to delete all event posts? This action cannot be undone.</p>';
+            echo '<input type="submit" name="delete_all_events_cloned" value="Delete All Events Cloned" class="button button-danger">';
+            echo '</form>';
+
+            if (isset($_POST['delete_all_events_cloned'])) {
+                delete_all_event_posts_cloned();
+            }
+        echo '</div>';
+
+        echo '<div class="event__wrap--remove">';
+            echo '<form method="post" action="">';
+            echo '<p>Or</p>';
+            echo '<input type="submit" name="delete_all_events" value="Delete All Events" class="button button-danger">';
+            echo '</form>';
+
+            if (isset($_POST['delete_all_events'])) {
+                delete_all_event_posts();
+            }
+        echo '</div>';
+    echo '</div>';
+}
+
+
+
+function log_media_posts_and_translations() {
+    $args = array(
+        'post_type' => 'media_posts',
+        'tax_query' => array(
+            array(
+                'taxonomy' => 'media_cat',
+                'field'    => 'slug',
+                'terms'    => 'event',
+                'operator' => 'IN',
+            ),
+        ),
+        'lang' => 'en',
+        'posts_per_page' => -1,
+    );
+
+    $media_posts_query = new WP_Query($args);
+
+    if ($media_posts_query->have_posts()) {
+        $json_file = WP_CONTENT_DIR . '/media_posts.json';
+
+        $media_posts_data = array();
+
+        while ($media_posts_query->have_posts()) {
+            $media_posts_query->the_post();
+            $post_id = get_the_ID();
+            $post_title = get_the_title();
+
+            $translations = pll_get_post_translations($post_id);
+
+            $list_translate = array();
+
+            foreach ($translations as $lang => $translated_post_id) {
+                if ($lang !== 'en') {
+                    $list_translate[] = array(
+                        'post_title' => $post_title,
+                        'post_id'    => $post_id,
+                        'translation' => array(
+                            'language' => $lang,
+                            'translated_post_id' => $translated_post_id
+                        )
+                    );
+                }
+            }
+
+            $post_data = array(
+                'post_title' => $post_title,
+                'post_id'    => $post_id,
+                'list_translate' => $list_translate
+            );
+
+            $media_posts_data[] = $post_data;
+        }
+
+        $json_data = json_encode($media_posts_data, JSON_PRETTY_PRINT);
+        file_put_contents($json_file, $json_data);
+
+        log_event("Logged media posts and translations to media_posts.json");
+
+        echo '<div class="updated"><p>Logged ' . $media_posts_query->found_posts . ' media posts and translations into media_posts.json</p></div>';
+    } else {
+        log_event("No media posts found to log.");
+        echo '<div class="error"><p>No media posts found to log.</p></div>';
+    }
+
+    wp_reset_postdata();
+}
+
+
+function delete_all_event_posts_cloned() {
+    if (!current_user_can('delete_posts')) {
+        log_event("User does not have delete_posts permission.");
+        return;
+    }
+
+    $json_file = WP_CONTENT_DIR . '/cloned_posts.json'; 
+
+    if (file_exists($json_file)) {
+        $cloned_posts = json_decode(file_get_contents($json_file), true);
+
+        if (is_array($cloned_posts) && !empty($cloned_posts)) {
+            foreach ($cloned_posts as $cloned_post) {
+                $post_id = $cloned_post['post_id'];
+
+                $acf_fields = get_fields($post_id);
+                if ($acf_fields) {
+                    foreach ($acf_fields as $field_name => $field_value) {  // Corrected to access both key and value
+                        delete_post_meta($post_id, $field_name);
+                        log_event("Deleted ACF field: {$field_name} for post ID: {$post_id}");
+                    }
+                }
+
+                $featured_image_id = get_post_meta($post_id, '_thumbnail_id', true);
+                if ($featured_image_id) {
+                    delete_post_meta($post_id, '_thumbnail_id');
+                }
+
+                $deleted = wp_delete_post($post_id, true);
+                if ($deleted) {
+                    log_event("Successfully deleted post with ID: {$post_id}");
+                } else {
+                    log_event("Failed to delete post with ID: {$post_id}");
+                }
+            }
+            echo '<div class="updated"><p>All cloned event posts and their ACF fields have been deleted.</p></div>';
+
+            unlink($json_file);
+            log_event("Deleted cloned_posts.json file.");
+        } else {
+            log_event("No cloned posts found in the JSON file.");
+            echo '<div class="error"><p>No cloned posts found in the JSON file.</p></div>';
+        }
+    } else {
+        log_event("File cloned_posts.json not found.");
+        echo '<div class="error"><p>File cloned_posts.json not found.</p></div>';
+    }
+}
+
+
+function delete_all_event_posts() {
+    if (!current_user_can('delete_posts')) {
+        log_event("User does not have delete_posts permission.");
+        return;
+    }
+
+    $languages = get_all_languages_for_select();
+    if (empty($languages)) {
+        log_event("No languages found.");
+        return;
+    }
+
+    foreach ($languages as $lang_code ) {
+        $query = new WP_Query(array(
+            'post_type'      => 'events',
+            'posts_per_page' => -1,
+            'lang'           => $lang_code,
+            'post_status'    => 'any',
+            'fields'         => 'ids',
+        ));
+
+        if ($query->have_posts()) {
+            while ($query->have_posts()) {
+                $query->the_post();
+                $post_id = get_the_ID();
+
+                $acf_fields = get_fields($post_id);
+                if ($acf_fields) {
+                    foreach ($acf_fields as $field_name => $field_value) {  // Correct the loop to access field name and value
+                        delete_post_meta($post_id, $field_name);  // Use $field_name to delete the ACF field
+                        log_event("Deleted ACF field: {$field_name} for post ID: {$post_id}");
+                    }
+                }
+
+                $deleted = wp_delete_post($post_id, true);
+                if ($deleted) {
+                    log_event("Successfully deleted post with ID: " . $post_id . " in language: " . $lang_code);
+                } else {
+                    log_event("Failed to delete post with ID: " . $post_id . " in language: " . $lang_code);
+                }
+            }
+            log_event("All event posts for language {$lang_code} have been deleted.");
+        } else {
+            log_event("No event posts found for language {$lang_code}.");
+        }
+
+        wp_reset_postdata();
+    }
+
+    echo '<div class="updated"><p>All event posts and their ACF fields have been deleted.</p></div>';
+}
+
+
+function log_event($message) {
+    $log_file = WP_CONTENT_DIR . '/event.log';
+    $log_data = current_time('mysql') . " - " . $message . "\n";
+    file_put_contents($log_file, $log_data, FILE_APPEND);
+}
+
+function log_cloned_post_id($post_id, $post_title, $original_post_id, $language) {
+    $json_file = WP_CONTENT_DIR . '/cloned_posts.json';
+
+    $cloned_posts = file_exists($json_file) ? json_decode(file_get_contents($json_file), true) : array();
+
+    $cloned_posts[] = array(
+        'post_id'        => $post_id,
+        'post_title'     => $post_title,
+        'original_post_id' => $original_post_id,
+        'language'       => $language,
+        'date_cloned'    => current_time('mysql'),
+    );
+
+    file_put_contents($json_file, json_encode($cloned_posts, JSON_PRETTY_PRINT));
+}
+
+
+add_action('admin_menu', function() {
+    add_menu_page('Clone Media Posts', 'Clone Media Posts', 'manage_options', 'clone-media-posts', 'clone_media_posts_to_events');
+});
